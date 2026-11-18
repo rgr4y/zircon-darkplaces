@@ -1115,6 +1115,29 @@ static qbool Mod_Q1BSP_TraceLineOfSight(struct model_s *model, const vec3_t star
 	return trace.fraction == 1 || BoxesOverlap(trace.endpos, trace.endpos, acceptmins, acceptmaxs);
 }
 
+// Light point cache. A prop that never moves asks for the same point on every frame, and on a map whose BSP nodes hold
+// thousands of coplanar faces each lookup scans them all (bakersfielddowntown: up to 9,500 faces per lookup, 0.7 ms per
+// frame for 245 models). The cache remembers which lightmap texel a point resolved to; the light style scaling is redone
+// on every call with the same arithmetic, so the result is identical and animated styles stay live.
+cvar_t mod_bsp_lightpointcache = {CF_CLIENT | CF_SERVER, "mod_bsp_lightpointcache", "1", "remember the lightmap texel found for a point, so models that do not move skip the BSP walk (0 = always walk, 2 = self test: walk as well and report any difference)"};
+#define LPCACHE_SIZE 4096
+typedef struct lpcache_s
+{
+	const model_t *model;				// NULL = empty
+	const unsigned char *lightdata;
+	unsigned int generation;
+	float p[3];
+	const msurface_t *surface;			// NULL = the walk found no lit face under the point
+	const unsigned char *lightmap;
+	int size3, line3;
+	float w00, w01, w10, w11;
+}
+lpcache_t;
+static lpcache_t lpcache[LPCACHE_SIZE];
+static lpcache_t *lpcache_record;		// set while a walk should record what it finds
+static unsigned int lpcache_checked;		// mod_bsp_lightpointcache 2: answers compared with a fresh walk
+static unsigned int lpcache_generation;	// bumped when any BSP loads its light data: entries of an older generation are dead
+
 static int Mod_BSP_LightPoint_RecursiveBSPNode(model_t *model, vec3_t ambientcolor, vec3_t diffusecolor, vec3_t diffusenormal, const mnode_t *node, float x, float y, float startz, float endz)
 {
 	int side;
@@ -1232,6 +1255,18 @@ static int Mod_BSP_LightPoint_RecursiveBSPNode(model_t *model, vec3_t ambientcol
 					// look up the pixel
 					lightmap = surface->lightmapinfo->samples + dti * line3 + dsi*3; // LadyHavoc: *3 for colored lighting
 
+					if (lpcache_record)
+					{
+						lpcache_record->surface = surface;
+						lpcache_record->lightmap = lightmap;
+						lpcache_record->size3 = size3;
+						lpcache_record->line3 = line3;
+						lpcache_record->w00 = w00;
+						lpcache_record->w01 = w01;
+						lpcache_record->w10 = w10;
+						lpcache_record->w11 = w11;
+					}
+
 					// bilinear filter each lightmap style, and sum them
 					for (maps = 0;maps < MAXLIGHTMAPS && surface->lightmapinfo->styles[maps] != 255;maps++)
 					{
@@ -1268,6 +1303,59 @@ static void Mod_BSP_LightPoint(model_t *model, const vec3_t p, vec3_t ambientcol
 	{
 		VectorSet(ambientcolor, 1, 1, 1);
 		VectorSet(diffusecolor, 0, 0, 0);
+		return;
+	}
+
+	if (mod_bsp_lightpointcache.integer)
+	{
+		union { float f[3]; unsigned int u[3]; } key;
+		unsigned int hash;
+		lpcache_t *e;
+		vec3_t before;
+		VectorCopy(ambientcolor, before);
+		VectorCopy(p, key.f);
+		hash = key.u[0] * 73856093u ^ key.u[1] * 19349663u ^ key.u[2] * 83492791u;
+		e = &lpcache[(hash ^ (hash >> 15)) & (LPCACHE_SIZE - 1)];
+		if (e->model == model && e->generation == lpcache_generation && e->lightdata == model->brushq1.lightdata && e->p[0] == p[0] && e->p[1] == p[1] && e->p[2] == p[2])
+		{
+			if (e->surface)
+			{
+				// the same sums as in Mod_BSP_LightPoint_RecursiveBSPNode
+				int maps;
+				float scale, w;
+				const unsigned char *lightmap = e->lightmap;
+				for (maps = 0;maps < MAXLIGHTMAPS && e->surface->lightmapinfo->styles[maps] != 255;maps++)
+				{
+					scale = r_refdef.scene.rtlightstylevalue[e->surface->lightmapinfo->styles[maps]];
+					w = e->w00 * scale;VectorMA(ambientcolor, w, lightmap                 , ambientcolor);
+					w = e->w01 * scale;VectorMA(ambientcolor, w, lightmap + 3             , ambientcolor);
+					w = e->w10 * scale;VectorMA(ambientcolor, w, lightmap + e->line3      , ambientcolor);
+					w = e->w11 * scale;VectorMA(ambientcolor, w, lightmap + e->line3 + 3  , ambientcolor);
+					lightmap += e->size3;
+				}
+			}
+			if (mod_bsp_lightpointcache.integer >= 2)
+			{
+				// self test: do the walk as well and report any difference
+				vec3_t check;
+				VectorCopy(before, check);
+				Mod_BSP_LightPoint_RecursiveBSPNode(model, check, diffusecolor, diffusenormal, model->brush.data_nodes + model->brushq1.hulls[0].firstclipnode, p[0], p[1], p[2] + 0.125, p[2] - 65536);
+				lpcache_checked++;
+				if (check[0] != ambientcolor[0] || check[1] != ambientcolor[1] || check[2] != ambientcolor[2])
+					Con_PrintLinef("mod_bsp_lightpointcache: MISMATCH at %f %f %f: cached %f %f %f, walk %f %f %f", p[0], p[1], p[2], ambientcolor[0], ambientcolor[1], ambientcolor[2], check[0], check[1], check[2]);
+				else if ((lpcache_checked & 0xFFFFF) == 0)
+					Con_PrintLinef("mod_bsp_lightpointcache: %u cached answers checked against the walk, all equal so far", lpcache_checked);
+			}
+			return;
+		}
+		e->model = model;
+		e->lightdata = model->brushq1.lightdata;
+		e->generation = lpcache_generation;
+		VectorCopy(p, e->p);
+		e->surface = NULL;
+		lpcache_record = e;
+		Mod_BSP_LightPoint_RecursiveBSPNode(model, ambientcolor, diffusecolor, diffusenormal, model->brush.data_nodes + model->brushq1.hulls[0].firstclipnode, p[0], p[1], p[2] + 0.125, p[2] - 65536);
+		lpcache_record = NULL;
 		return;
 	}
 
@@ -2089,6 +2177,7 @@ regularo:
 
 static void Mod_Q1BSP_LoadLighting(sizebuf_t *sb)
 {
+	lpcache_generation++;
 	int i;
 	unsigned char *in, *out, *data, d;
 	char litfilename[MAX_QPATH_128];
@@ -4838,6 +4927,7 @@ static void Mod_Q2BSP_LoadTexinfo(sizebuf_t *sb)
 
 static void Mod_Q2BSP_LoadLighting(sizebuf_t *sb)
 {
+	lpcache_generation++;
 	// LadyHavoc: this fits exactly the same format that we use in .lit files
 	loadmodel->brushq1.lightdata = (unsigned char *)Mem_Alloc(loadmodel->mempool, sb->cursize);
 	MSG_ReadBytes(sb, sb->cursize, loadmodel->brushq1.lightdata);
@@ -8715,6 +8805,7 @@ void Mod_BrushInit(void)
 	Cvar_RegisterVariable(&mod_q3shader_force_addalpha);
 	Cvar_RegisterVariable(&mod_q3shader_force_terrain_alphaflag);
 	Cvar_RegisterVariable(&mod_q1bsp_polygoncollisions);
+	Cvar_RegisterVariable(&mod_bsp_lightpointcache);
 	Cvar_RegisterVariable(&mod_q1bsp_zero_hullsize_cutoff);
 	Cvar_RegisterVariable(&mod_recalculatenodeboxes);
 

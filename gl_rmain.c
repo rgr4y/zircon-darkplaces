@@ -34,6 +34,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 extern "C" {
 #endif
 __declspec(dllexport) DWORD NvOptimusEnablement = 0x00000001;
+// The same request for AMD laptops with switchable graphics (integrated Radeon plus a Radeon card).
+__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 #ifdef __cplusplus
 }
 #endif

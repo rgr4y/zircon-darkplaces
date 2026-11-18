@@ -3171,6 +3171,15 @@ void PRVM_Prog_Reset(prvm_prog_t *prog)
 		if (prog->po)
 			PRVM_PO_Destroy((po_t *) prog->po);
 	}
+	else if (prog->progs_mempool)
+	{
+		// SV_Shutdown and CL_Disconnect clear prog->loaded (so no QC runs after shutdown) but leave the VM allocated.
+		// The memset below then dropped the only pointer to its pool: every "map" command leaked the whole server VM
+		// (edicts, fields, the progs file: 20 to 30 MB).
+		Mem_FreePool(&prog->progs_mempool);
+		if (prog->po)
+			PRVM_PO_Destroy((po_t *) prog->po);
+	}
 	memset(prog,0,sizeof(prvm_prog_t));
 	prog->break_statement = -1;
 	prog->watch_global_type = ev_void;

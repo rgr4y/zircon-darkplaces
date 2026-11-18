@@ -400,13 +400,27 @@ typedef struct pack_s
 } pack_t;
 //@}
 
+/// Per loose directory: which first-level folders exist (see FS_DirMayContain)
+#define FS_DIRCACHE_MAX 64
+#define FS_DIRCACHE_TTL 5.0
+typedef struct fs_dircache_entry_s {
+	char name[32];
+	qbool exists;
+	double expires;
+	unsigned epoch;
+} fs_dircache_entry_t;
+
 /// Search paths for files (including packages)
 typedef struct searchpath_s {
 	// only one of filename / pack will be used
 	char filename[MAX_OSPATH];
 	pack_t *pack;
 	struct searchpath_s *next;
+	fs_dircache_entry_t dircache[FS_DIRCACHE_MAX]; // loose dirs and vpacks only; Mem_Alloc zero-fills
+	int dircache_count;
 } searchpath_t;
+
+static unsigned fs_dircache_epoch = 1; // bumped whenever the engine creates a directory or rescans
 
 
 /*
@@ -463,6 +477,7 @@ gamedir_t *fs_all_gamedirs = NULL;
 int fs_all_gamedirs_count = 0;
 
 cvar_t scr_screenshot_name = {CF_CLIENT | CF_PERSISTENT, "scr_screenshot_name","dp", "prefix name for saved screenshots (changes based on -game commandline, as well as which game mode is running; the date is encoded using strftime escapes)"};
+cvar_t fs_dircache = {CF_CLIENT | CF_SERVER, "fs_dircache", "1", "skip loose-file lookups under top-level folders that do not exist in a game directory (0 = ask the OS for every name)"};
 cvar_t fs_empty_files_in_pack_mark_deletions = {CF_CLIENT | CF_SERVER, "fs_empty_files_in_pack_mark_deletions", "0", "if enabled, empty files in a pak/pk3 count as not existing but cancel the search in further packs, effectively allowing patch pak/pk3 files to 'delete' files"};
 cvar_t cvar_fs_gamedir = {CF_CLIENT | CF_SERVER | CF_READONLY | CF_PERSISTENT, "fs_gamedir", "", "the list of currently selected gamedirs (use the 'gamedir' command to change this)"};
 
@@ -1519,6 +1534,8 @@ void FS_Rescan (void)
 	qbool is_a_reset = false;
 	char gamedirbuf[MAX_INPUTLINE_16384];
 	char vabuf[1024];
+
+	fs_dircache_epoch++; // folders may have appeared or vanished
 
 	if (fs_searchpaths != NULL) {
 		// Baker: This statement will always hit in Zircon
@@ -2958,6 +2975,91 @@ Return the searchpath where the file was found (or NULL)
 and the file index in the package if relevant
 ====================
 */
+/*
+====================
+FS_DirMayContain
+
+A loose directory (or .pk3dir) answers every lookup with an OS call, and a
+texture load asks for ~40 optional names (_norm, _glow, _pants ... as
+.tga/.png/.jpg/.pcx) that almost never exist. Remember which first-level
+folders exist per search path, so <dir>/progs/x is not asked for when
+<dir>/progs is missing.
+
+Returns false only when the first folder of name is known to be missing.
+Names without a '/' are never cached. Entries expire after FS_DIRCACHE_TTL
+seconds and are dropped when the engine creates a directory (FS_mkdir) or
+rescans (FS_Rescan). Matching is case-sensitive: on a case-sensitive file
+system "Progs" and "progs" are different folders.
+====================
+*/
+static qbool FS_DirMayContain (searchpath_t *search, const char *name)
+{
+	const char *slash;
+	size_t len;
+	int i;
+	double now;
+	fs_dircache_entry_t *e;
+	char netpath[MAX_OSPATH];
+
+	if (!fs_dircache.integer)
+		return true;
+	slash = strchr(name, '/');
+	if (!slash)
+		return true;
+	if (strstr(name, ".."))
+		return true; // "missing/../x" can still resolve to an existing file: leave it to the OS
+	len = slash - name;
+	if (len == 0 || len >= sizeof(search->dircache[0].name))
+		return true;
+
+	now = Sys_DirtyTime();
+	for (i = 0; i < search->dircache_count; i++) {
+		e = &search->dircache[i];
+		if (e->name[len] == 0 && !strncmp(e->name, name, len)) {
+			if (e->epoch == fs_dircache_epoch && now < e->expires && now >= e->expires - FS_DIRCACHE_TTL)
+				return e->exists;
+			break; // stale: ask again and reuse this slot
+		}
+	}
+	if (i == search->dircache_count) {
+		if (search->dircache_count < FS_DIRCACHE_MAX) {
+			search->dircache_count++;
+		} else {
+			// table full: reuse the entry that was refreshed longest ago
+			int j;
+			for (i = 0, j = 1; j < FS_DIRCACHE_MAX; j++)
+				if (search->dircache[j].expires < search->dircache[i].expires)
+					i = j;
+		}
+	}
+	e = &search->dircache[i];
+	memcpy(e->name, name, len);
+	e->name[len] = 0;
+	dpsnprintf(netpath, sizeof(netpath), "%s%s", search->filename, e->name);
+	e->exists = FS_SysFileOrDirectoryType(netpath) == FS_FILETYPE_DIRECTORY_2;
+	e->expires = now + FS_DIRCACHE_TTL;
+	e->epoch = fs_dircache_epoch;
+	return e->exists;
+}
+
+static void FS_DirCacheList_f (cmd_state_t *cmd)
+{
+	searchpath_t *search;
+	double now = Sys_DirtyTime();
+	int i;
+
+	for (search = fs_searchpaths; search; search = search->next) {
+		if (search->pack && !search->pack->vpack)
+			continue;
+		Con_PrintLinef ("%s: %d of %d entries", search->filename, search->dircache_count, FS_DIRCACHE_MAX);
+		for (i = 0; i < search->dircache_count; i++) {
+			fs_dircache_entry_t *e = &search->dircache[i];
+			Con_PrintLinef ("  %-31s %s%s", e->name, e->exists ? "exists" : "missing",
+				(e->epoch != fs_dircache_epoch || now >= e->expires) ? " (stale)" : "");
+		}
+	}
+}
+
 /*SAFE*/ static searchpath_t *FS_FindFile (const char *name, int *index, qbool quiet)
 {
 	searchpath_t *search;
@@ -3011,6 +3113,9 @@ and the file index in the package if relevant
 			}
 		} else {
 			char netpath[MAX_OSPATH];
+
+			if (!FS_DirMayContain (search, name))
+				continue; // its first folder does not exist in this directory
 			dpsnprintf(netpath, sizeof(netpath), "%s%s", search->filename, name);
 
 			if (FS_SysFileExists (netpath)) {
@@ -4992,6 +5097,7 @@ qbool FS_IsDirectory (ccs *filename)
 		// and its own callers always use the directory afterwards and
 		// thus will detect failure that way.
 	}
+	fs_dircache_epoch++; // a folder FS_DirMayContain remembered as missing may exist now
 }
 
 /*REALPATH*/ qbool FS_chdir (const char *realpath)
@@ -5089,6 +5195,8 @@ void FS_InitOnce_Commands(void)
 {
 	Cvar_RegisterVariable (&scr_screenshot_name);
 	Cvar_RegisterVariable (&fs_empty_files_in_pack_mark_deletions);
+	Cvar_RegisterVariable (&fs_dircache);
+	Cmd_AddCommand(CF_SHARED, "fs_dircache_list", FS_DirCacheList_f, "list which first-level folders each loose game directory is known to have (fs_dircache)");
 	Cvar_RegisterVariable (&cvar_fs_gamedir);
 
 	Cvar_RegisterVariable (&q3map2_csg_compiler);

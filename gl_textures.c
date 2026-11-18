@@ -401,6 +401,10 @@ void R_FreeTexture(rtexture_t *rt)
 
 	if (glt->inputtexels)
 		Mem_Free(glt->inputtexels);
+	// TEXF_ALLOWUPDATES textures (every lightmap page) keep a full copy of their pixels in bufferpixels.
+	// It was never freed, so each map change leaked the previous map's lightmaps (about 30 MB a map).
+	if (glt->bufferpixels)
+		Mem_Free(glt->bufferpixels);
 	Mem_ExpandableArray_FreeRecord(&texturearray, glt);
 }
 

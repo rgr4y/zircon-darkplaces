@@ -1096,9 +1096,19 @@ int VID_Shared_SetJoystick(int index)
 	int xinputindex = -1;
 	int xinputavailable = 0;
 	xinput_state_t state;
+	// XInputGetState on an empty slot enumerates devices (about 25 microseconds each with xinput1_3), and this runs every
+	// frame: empty slots are re-probed once a second, slots that had a controller on the last probe every frame
+	static double nextprobe = 0;
+	static int lastavailable = 0;
+	double now = Sys_DirtyTime();
+	qbool probe = now >= nextprobe || now < nextprobe - 2;
+	if (probe)
+		nextprobe = now + 1;
 	// detect available XInput controllers
 	for (i = 0;i < 4;i++)
 	{
+		if (!probe && !(lastavailable & (1<<i)))
+			continue;
 		if (qXInputGetState && qXInputGetState(i, &state) == S_OK)
 		{
 			xinputavailable |= 1<<i;
@@ -1107,6 +1117,7 @@ int VID_Shared_SetJoystick(int index)
 			xinputcount++;
 		}
 	}
+	lastavailable = xinputavailable;
 	if (joy_xinputavailable.integer != xinputavailable)
 		Cvar_SetValueQuick(&joy_xinputavailable, xinputavailable);
 	if (vid_xinputindex != xinputindex)
